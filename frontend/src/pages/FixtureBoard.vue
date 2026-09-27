@@ -173,6 +173,54 @@ function confirmRemove(fixture: Fixture): void {
   })
 }
 
+const showSwapModal = ref(false)
+const swapSource = ref<Fixture | null>(null)
+const swapSpareId = ref<string | null>(null)
+
+const swapModalTitle = computed(() => (swapSource.value ? `换灯 · CH${swapSource.value.channel}` : '换灯'))
+
+/** 备用通道候选：本场除故障通道外已配接的通道 */
+const swapCandidates = computed(() =>
+  swapSource.value ? flatFixtures.value.filter((fixture) => fixture.id !== swapSource.value?.id) : []
+)
+
+const swapOptions = computed(() =>
+  swapCandidates.value.map((fixture) => ({
+    label: `CH${fixture.channel} · ${fixture.position} · ${fixture.fixtureType}`,
+    value: fixture.id
+  }))
+)
+
+const swapLevelCount = computed(() =>
+  swapSource.value ? levelStore.levels.filter((level) => level.fixtureId === swapSource.value?.id).length : 0
+)
+
+function openSwap(fixture: Fixture): void {
+  swapSource.value = fixture
+  swapSpareId.value = null
+  showSwapModal.value = true
+}
+
+function handleSwapSpareChange(value: string | number | Array<string | number> | null): void {
+  swapSpareId.value = typeof value === 'string' ? value : null
+}
+
+async function submitSwap(): Promise<void> {
+  if (!swapSource.value) return
+  if (!swapSpareId.value) {
+    message.error('请先选择备用通道')
+    return
+  }
+  const result = await fixtureStore.swapFixture(swapSource.value.id, swapSpareId.value)
+  if (!result.ok) {
+    message.error(result.message)
+    return
+  }
+  message.success(result.message)
+  showSwapModal.value = false
+  swapSource.value = null
+}
+
 function goCues(): void {
   void router.push(`/sessions/${sessionId.value}/cues`)
 }
@@ -301,6 +349,7 @@ function positionColor(position: FixturePosition): string {
               <span class="fixture-row__type">{{ fixture.fixtureType }}</span>
               <span class="fixture-row__note">{{ fixture.patchNote || '无配接备注' }}</span>
               <span class="toolbar__spacer" />
+              <NButton size="tiny" quaternary @click="openSwap(fixture)">换灯</NButton>
               <NButton size="tiny" quaternary @click="openEdit(fixture)">编辑</NButton>
               <NButton size="tiny" quaternary type="error" @click="confirmRemove(fixture)">删除</NButton>
             </div>
@@ -338,6 +387,7 @@ function positionColor(position: FixturePosition): string {
             <span class="mono">{{ fixture.gel || '—' }}</span>
             <span class="channel-table__note">{{ fixture.patchNote || '—' }}</span>
             <span class="channel-table__actions">
+              <NButton size="tiny" quaternary @click="openSwap(fixture)">换灯</NButton>
               <NButton size="tiny" quaternary @click="openEdit(fixture)">编辑</NButton>
               <NButton size="tiny" quaternary type="error" @click="confirmRemove(fixture)">删除</NButton>
             </span>
@@ -380,6 +430,41 @@ function positionColor(position: FixturePosition): string {
         <div class="modal-footer">
           <NButton @click="showModal = false">取消</NButton>
           <NButton type="primary" @click="submitForm">保存</NButton>
+        </div>
+      </template>
+    </NModal>
+
+    <NModal v-model:show="showSwapModal" preset="card" :title="swapModalTitle" class="form-modal" :mask-closable="false">
+      <template v-if="swapSource">
+        <NAlert v-if="swapCandidates.length === 0" type="warning" :bordered="false" class="swap-alert">
+          本场除 CH{{ swapSource.channel }} 外没有其他已配接的通道，备用通道未配灯，换灯不生效。 请先为备用灯新建灯位通道，再来换灯。
+        </NAlert>
+        <template v-else>
+          <NAlert type="info" :bordered="false" class="swap-alert">
+            换灯后 CH{{ swapSource.channel }} 的 {{ swapLevelCount }} 条通道电平将转到备用通道继续沿用；
+            同一条 Cue 两边都设过电平时只保留亮度大的一条，不留两份。 确认后 CH{{ swapSource.channel }} 退出本场，已生成的排演表仍保留当天的通道号与亮度。
+          </NAlert>
+          <NForm label-placement="left" label-width="92">
+            <NFormItem label="故障通道">
+              <span>CH{{ swapSource.channel }} · {{ swapSource.position }} · {{ swapSource.fixtureType }}</span>
+            </NFormItem>
+            <NFormItem label="备用通道">
+              <NSelect
+                :value="swapSpareId"
+                :options="swapOptions"
+                placeholder="选择本场已配接的备用通道"
+                @update:value="handleSwapSpareChange"
+              />
+            </NFormItem>
+          </NForm>
+        </template>
+      </template>
+      <template #footer>
+        <div class="modal-footer">
+          <NButton @click="showSwapModal = false">取消</NButton>
+          <NButton v-if="swapCandidates.length > 0" type="primary" :disabled="!swapSpareId" @click="submitSwap">
+            确认换灯
+          </NButton>
         </div>
       </template>
     </NModal>
@@ -531,7 +616,7 @@ function positionColor(position: FixturePosition): string {
 .channel-table__head,
 .channel-table__row {
   display: grid;
-  grid-template-columns: 190px 80px 90px 90px 1fr 130px;
+  grid-template-columns: 190px 80px 90px 90px 1fr 180px;
   align-items: center;
   gap: 10px;
   padding: 9px 6px;
@@ -585,6 +670,10 @@ function positionColor(position: FixturePosition): string {
 .form-modal {
   width: 520px;
   max-width: 92vw;
+}
+
+.swap-alert {
+  margin: 0 0 14px;
 }
 
 .modal-footer {

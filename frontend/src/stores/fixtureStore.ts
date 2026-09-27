@@ -17,6 +17,16 @@ export interface FixtureWriteResult {
   fixture: Fixture | null
 }
 
+/** 换灯（备用通道顶替）的结果 */
+export interface FixtureSwapResult {
+  ok: boolean
+  message: string
+  /** 直接转移到备用通道的电平条数 */
+  moved: number
+  /** 与备用通道已有电平合并的条数（保留亮度大者） */
+  merged: number
+}
+
 function validateChannel(channel: number): string | null {
   if (!Number.isInteger(channel)) return '通道号必须为整数'
   if (channel < DMX_CHANNEL_MIN || channel > DMX_CHANNEL_MAX) {
@@ -131,6 +141,35 @@ export const useFixtureStore = defineStore('fixture', () => {
     applyPatchCheck(target.sessionId, buildPatchCheck(fixturesOfSession(target.sessionId)))
   }
 
+  /**
+   * 换灯：用本场已配接的备用通道顶替故障通道。
+   * 原通道的电平先转移到备用通道（同 Cue 两边都设过时保留亮度大者），随后原通道退出本场；
+   * 备用通道未在本场配灯时不生效。已生成的排演表为快照，保留原通道号与亮度，不受影响。
+   */
+  async function swapFixture(fixtureId: string, spareFixtureId: string): Promise<FixtureSwapResult> {
+    const fail = (message: string): FixtureSwapResult => ({ ok: false, message, moved: 0, merged: 0 })
+    const source = fixtureById(fixtureId)
+    if (!source) return fail('原通道不存在，换灯未生效')
+    const spare = fixtureById(spareFixtureId)
+    if (!spare || spare.sessionId !== source.sessionId) {
+      return fail(`备用通道未在本场配灯，换灯未生效。请先在配置台为备用灯配接通道。`)
+    }
+    if (spare.id === source.id) return fail('备用通道不能是原通道本身，换灯未生效')
+
+    const levelStore = useLevelStore()
+    const { moved, merged } = await levelStore.transferLevels(source.id, spare.id)
+    await removeFixture(source.id)
+    const mergedText = merged > 0 ? `，其中 ${merged} 条与备用通道已有电平合并（保留亮度大者）` : ''
+    return {
+      ok: true,
+      message:
+        `已换灯：CH${source.channel} → CH${spare.channel}，转移 ${moved} 条通道电平${mergedText}，` +
+        `CH${source.channel} 已退出本场。已生成的排演表仍保留原通道号与亮度。`,
+      moved,
+      merged
+    }
+  }
+
   async function removeBySession(sessionId: string): Promise<void> {
     const targets = fixturesOfSession(sessionId)
     if (targets.length === 0) return
@@ -155,6 +194,7 @@ export const useFixtureStore = defineStore('fixture', () => {
     addFixture,
     updateFixture,
     removeFixture,
-    removeBySession
+    removeBySession,
+    swapFixture
   }
 })

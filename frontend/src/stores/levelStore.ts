@@ -12,6 +12,14 @@ export interface CueLevelPatch {
   focusNote?: string
 }
 
+/** 换灯时电平转移的统计结果 */
+export interface LevelTransferResult {
+  /** 直接转移到备用通道的条数 */
+  moved: number
+  /** 与备用通道已有电平合并的条数（保留亮度大者） */
+  merged: number
+}
+
 function clampIntensity(value: number): number {
   if (!Number.isFinite(value)) return 0
   return Math.min(INTENSITY_MAX, Math.max(INTENSITY_MIN, Math.round(value)))
@@ -108,6 +116,49 @@ export const useLevelStore = defineStore('level', () => {
     levels.value = levels.value.filter((level) => level.fixtureId !== fixtureId)
   }
 
+  /**
+   * 换灯：把源通道的全部电平转移到备用通道。
+   * 同一条 Cue 两边都设过电平时只保留亮度大的一条（色温、对焦说明跟随被保留的记录），
+   * 保证同一 Cue 在同一通道上不留两份电平。
+   */
+  async function transferLevels(fromFixtureId: string, toFixtureId: string): Promise<LevelTransferResult> {
+    const sources = levels.value.filter((level) => level.fixtureId === fromFixtureId)
+    const result: LevelTransferResult = { moved: 0, merged: 0 }
+    if (sources.length === 0) return result
+
+    const now = Date.now()
+    const puts: CueLevel[] = []
+    const deletes: string[] = []
+
+    sources.forEach((source) => {
+      const target = levelOf(source.cueId, toFixtureId)
+      if (!target) {
+        puts.push({ ...source, fixtureId: toFixtureId, updatedAt: now })
+        result.moved += 1
+        return
+      }
+      result.merged += 1
+      if (source.intensity > target.intensity) {
+        // 源通道这条更亮：其设定顶到备用通道上，备用通道原记录让位
+        puts.push({ ...source, fixtureId: toFixtureId, updatedAt: now })
+        deletes.push(target.id)
+      } else {
+        // 备用通道已有记录不弱于源：保留备用通道的，丢弃源记录
+        deletes.push(source.id)
+      }
+    })
+
+    await db.transaction('rw', db.levels, async () => {
+      if (deletes.length > 0) await db.levels.bulkDelete(deletes)
+      if (puts.length > 0) await db.levels.bulkPut(puts)
+    })
+
+    const removed = new Set(deletes)
+    const replaced = new Set(puts.map((level) => level.id))
+    levels.value = [...levels.value.filter((level) => !removed.has(level.id) && !replaced.has(level.id)), ...puts]
+    return result
+  }
+
   async function removeByCues(cueIds: readonly string[]): Promise<void> {
     const removing = new Set(cueIds)
     const ids = levels.value.filter((level) => removing.has(level.cueId)).map((level) => level.id)
@@ -129,6 +180,7 @@ export const useLevelStore = defineStore('level', () => {
     removeLevel,
     removeByCue,
     removeByFixture,
-    removeByCues
+    removeByCues,
+    transferLevels
   }
 })
