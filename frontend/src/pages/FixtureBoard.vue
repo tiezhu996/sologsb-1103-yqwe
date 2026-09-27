@@ -17,6 +17,7 @@ import {
 import BlankHint from '@/components/common/BlankHint.vue'
 import ChannelChip from '@/components/common/ChannelChip.vue'
 import { useChannelConflict } from '@/hooks/useChannelConflict'
+import { useCueStore } from '@/stores/cueStore'
 import { useFixtureStore } from '@/stores/fixtureStore'
 import { useLevelStore } from '@/stores/levelStore'
 import { useSessionStore } from '@/stores/sessionStore'
@@ -31,6 +32,7 @@ import {
   type FixturePosition,
   type FixtureType
 } from '@/types/fixture'
+import { buildRelampPlan } from '@/utils/relamp'
 
 const route = useRoute()
 const router = useRouter()
@@ -39,6 +41,7 @@ const dialog = useDialog()
 const sessionStore = useSessionStore()
 const fixtureStore = useFixtureStore()
 const levelStore = useLevelStore()
+const cueStore = useCueStore()
 
 const sessionId = computed(() => String(route.params.id ?? ''))
 const session = computed(() => sessionStore.sessionById(sessionId.value))
@@ -173,6 +176,125 @@ function confirmRemove(fixture: Fixture): void {
   })
 }
 
+/* ---------------- 彩排前换灯：故障通道 → 本场备用通道 ---------------- */
+
+/** 手输通道号生成的临时标签前缀，与灯位主键（fix_ 开头）区分 */
+const SWAP_TAG_PREFIX = 'ch:'
+
+const showSwapModal = ref(false)
+const swappingFixture = ref<Fixture | null>(null)
+/** NSelect 选中值：灯位 id，或手输通道号生成的 `ch:12` 临时标签 */
+const swapTargetValue = ref<string | null>(null)
+const swapSubmitting = ref(false)
+
+const swapOptions = computed(() =>
+  flatFixtures.value
+    .filter((fixture) => fixture.id !== swappingFixture.value?.id)
+    .map((fixture) => ({
+      label: `CH${fixture.channel} · ${fixture.position} · ${fixture.fixtureType}${fixture.patchNote ? ` · ${fixture.patchNote}` : ''}`,
+      value: fixture.id
+    }))
+)
+
+/** 手输通道号：过滤后归一为 `ch:<整数>` 标签 */
+function createSwapTag(rawValue: string): string {
+  const digits = rawValue.replace(/[^\d]/g, '')
+  return `${SWAP_TAG_PREFIX}${digits}`
+}
+
+interface SwapTargetState {
+  fixture: Fixture | null
+  /** 不生效原因；为 null 表示选中了本场已配接的备用通道 */
+  reason: string | null
+}
+
+/** 解析当前选中的备用通道：已配接灯位直接命中；手输通道号要求本场恰好配过 */
+const swapTargetState = computed<SwapTargetState>(() => {
+  const value = swapTargetValue.value
+  const source = swappingFixture.value
+  if (!source) return { fixture: null, reason: null }
+  if (!value) return { fixture: null, reason: null }
+
+  if (!value.startsWith(SWAP_TAG_PREFIX)) {
+    const fixture = flatFixtures.value.find((item) => item.id === value) ?? null
+    if (fixture && fixture.id === source.id) return { fixture: null, reason: '备用通道不能与原通道相同。' }
+    return { fixture, reason: fixture ? null : '该备用通道在本场没有配过灯，换灯不生效。' }
+  }
+
+  const digits = value.slice(SWAP_TAG_PREFIX.length)
+  if (!digits) return { fixture: null, reason: null }
+  const channel = Number(digits)
+  if (!Number.isInteger(channel) || channel < DMX_CHANNEL_MIN || channel > DMX_CHANNEL_MAX) {
+    return { fixture: null, reason: `DMX 通道号需在 ${DMX_CHANNEL_MIN}-${DMX_CHANNEL_MAX} 之间。` }
+  }
+  const matched = flatFixtures.value.filter((item) => item.channel === channel && item.id !== source.id)
+  if (matched.length === 0) {
+    return { fixture: null, reason: `备用通道 CH${channel} 本场没配过灯，换灯不生效；请先配接或改选列表中的通道。` }
+  }
+  if (matched.length > 1) {
+    return { fixture: null, reason: `CH${channel} 在本场有多个配接，请从下拉列表中明确选择一条备用通道。` }
+  }
+  return { fixture: matched[0], reason: null }
+})
+
+const swapPlan = computed(() => {
+  const source = swappingFixture.value
+  const target = swapTargetState.value.fixture
+  if (!source || !target) return null
+  return buildRelampPlan(
+    levelStore.levels.filter((level) => level.fixtureId === source.id),
+    levelStore.levels.filter((level) => level.fixtureId === target.id)
+  )
+})
+
+/** 两边都设过电平的 Cue 明细，用于确认前列出二选一结果 */
+const swapConflictItems = computed(() => {
+  const plan = swapPlan.value
+  if (!plan) return []
+  return plan.items
+    .filter((item) => item.conflict !== null)
+    .map((item) => {
+      const conflict = item.conflict as NonNullable<typeof item.conflict>
+      return {
+        cueId: item.cueId,
+        cueNo: cueStore.cueById(item.cueId)?.cueNo ?? '已删除的 Cue',
+        intensity: conflict.intensity,
+        droppedIntensity: conflict.droppedIntensity,
+        winner: conflict.winner
+      }
+    })
+})
+
+function swapTargetLabel(): string {
+  const target = swapTargetState.value.fixture
+  return target ? `CH${target.channel}（${target.position} · ${target.fixtureType}）` : ''
+}
+
+function openSwap(fixture: Fixture): void {
+  swappingFixture.value = fixture
+  swapTargetValue.value = null
+  swapSubmitting.value = false
+  showSwapModal.value = true
+}
+
+async function submitSwap(): Promise<void> {
+  const source = swappingFixture.value
+  const target = swapTargetState.value.fixture
+  if (!source || !target || swapSubmitting.value) return
+  swapSubmitting.value = true
+  try {
+    const result = await fixtureStore.relampFixture(source.id, target.id)
+    if (!result.ok) {
+      message.error(result.reason ?? result.message)
+      return
+    }
+    message.success(result.message)
+    showSwapModal.value = false
+  } finally {
+    swapSubmitting.value = false
+  }
+}
+
 function goCues(): void {
   void router.push(`/sessions/${sessionId.value}/cues`)
 }
@@ -302,6 +424,7 @@ function positionColor(position: FixturePosition): string {
               <span class="fixture-row__note">{{ fixture.patchNote || '无配接备注' }}</span>
               <span class="toolbar__spacer" />
               <NButton size="tiny" quaternary @click="openEdit(fixture)">编辑</NButton>
+              <NButton size="tiny" quaternary type="warning" @click="openSwap(fixture)">换灯</NButton>
               <NButton size="tiny" quaternary type="error" @click="confirmRemove(fixture)">删除</NButton>
             </div>
           </div>
@@ -339,6 +462,7 @@ function positionColor(position: FixturePosition): string {
             <span class="channel-table__note">{{ fixture.patchNote || '—' }}</span>
             <span class="channel-table__actions">
               <NButton size="tiny" quaternary @click="openEdit(fixture)">编辑</NButton>
+              <NButton size="tiny" quaternary type="warning" @click="openSwap(fixture)">换灯</NButton>
               <NButton size="tiny" quaternary type="error" @click="confirmRemove(fixture)">删除</NButton>
             </span>
           </div>
@@ -380,6 +504,87 @@ function positionColor(position: FixturePosition): string {
         <div class="modal-footer">
           <NButton @click="showModal = false">取消</NButton>
           <NButton type="primary" @click="submitForm">保存</NButton>
+        </div>
+      </template>
+    </NModal>
+
+    <NModal
+      v-model:show="showSwapModal"
+      preset="card"
+      title="彩排前换灯：通道电平转备用通道"
+      class="form-modal swap-modal"
+      :mask-closable="false"
+    >
+      <template v-if="swappingFixture">
+        <div class="swap-source">
+          <span class="swap-source__label">故障通道</span>
+          <ChannelChip
+            :channel="swappingFixture.channel"
+            :position="swappingFixture.position"
+            :intensity="averageIntensityOf(swappingFixture.id)"
+            :gel="swappingFixture.gel"
+            :fixture-type="swappingFixture.fixtureType"
+          />
+          <span class="swap-source__text">
+            {{ swappingFixture.position }} · {{ swappingFixture.fixtureType }}，换灯后退出本场
+          </span>
+        </div>
+
+        <NForm label-placement="left" label-width="92">
+          <NFormItem label="备用通道">
+            <NSelect
+              v-model:value="swapTargetValue"
+              :options="swapOptions"
+              filterable
+              tag
+              clearable
+              placeholder="选择本场已配接的通道，或直接输入通道号"
+              :create-tag="createSwapTag"
+            />
+          </NFormItem>
+        </NForm>
+
+        <NAlert v-if="swapTargetState.reason" type="warning" :bordered="false" class="alert-line">
+          {{ swapTargetState.reason }}
+        </NAlert>
+
+        <div v-if="swapPlan && swapTargetState.fixture" class="swap-plan">
+          <p class="swap-plan__line">
+            原通道 {{ swapPlan.movedCount }} 条电平转到备用通道{{ swapTargetLabel() }}继续使用；
+            <template v-if="swapPlan.conflictCount > 0">
+              {{ swapPlan.conflictCount }} 条 Cue 两边都设过电平，只留亮度大的那条
+              （备用通道更亮保留 {{ swapPlan.targetWinsCount }} 条，原通道更亮顶替 {{ swapPlan.sourceWinsCount }} 条）。
+            </template>
+            <template v-else>备用通道与原通道没有同 Cue 重复的电平。</template>
+          </p>
+          <ul v-if="swapConflictItems.length > 0" class="swap-plan__conflicts">
+            <li v-for="item in swapConflictItems" :key="item.cueId">
+              <span class="mono">{{ item.cueNo }}</span>
+              <span :class="item.winner === 'source' ? 'swap-plan__win-source' : 'swap-plan__win-target'">
+                保留 {{ item.winner === 'source' ? `原通道 ${item.intensity}%` : `备用通道 ${item.intensity}%` }}
+              </span>
+              <span class="swap-plan__drop mono">舍弃 {{ item.droppedIntensity }}%</span>
+            </li>
+          </ul>
+          <p class="swap-plan__note">同一 Cue 在同一通道上只保留一份电平（含亮度、色温与对焦说明）。</p>
+        </div>
+
+        <NAlert type="info" :bordered="false" class="alert-line" :show-icon="true">
+          已生成的排演表照旧留着生成当天的通道号与亮度，不受本次换灯影响。
+        </NAlert>
+      </template>
+
+      <template #footer>
+        <div class="modal-footer">
+          <NButton @click="showSwapModal = false">取消</NButton>
+          <NButton
+            type="primary"
+            :loading="swapSubmitting"
+            :disabled="!swapTargetState.fixture"
+            @click="submitSwap"
+          >
+            确认换灯
+          </NButton>
         </div>
       </template>
     </NModal>
@@ -531,7 +736,7 @@ function positionColor(position: FixturePosition): string {
 .channel-table__head,
 .channel-table__row {
   display: grid;
-  grid-template-columns: 190px 80px 90px 90px 1fr 130px;
+  grid-template-columns: 190px 80px 90px 90px 1fr 196px;
   align-items: center;
   gap: 10px;
   padding: 9px 6px;
@@ -591,5 +796,77 @@ function positionColor(position: FixturePosition): string {
   display: flex;
   justify-content: flex-end;
   gap: 10px;
+}
+
+.swap-modal {
+  width: 560px;
+  max-width: 92vw;
+}
+
+.swap-source {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 10px 12px;
+  margin-bottom: 14px;
+  border-radius: 10px;
+  background: rgba(232, 84, 84, 0.07);
+  border: 1px solid rgba(232, 84, 84, 0.25);
+  font-size: 13px;
+}
+
+.swap-source__label {
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.55);
+}
+
+.swap-source__text {
+  color: rgba(255, 255, 255, 0.62);
+}
+
+.swap-plan {
+  margin: 4px 0 12px;
+  padding: 12px 14px;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.swap-plan__line {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.7;
+  color: rgba(255, 255, 255, 0.78);
+}
+
+.swap-plan__conflicts {
+  margin: 8px 0 0;
+  padding-left: 18px;
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.6);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.swap-plan__win-source {
+  margin: 0 8px;
+  color: #ffd79a;
+}
+
+.swap-plan__win-target {
+  margin: 0 8px;
+  color: #9fd0ff;
+}
+
+.swap-plan__drop {
+  color: rgba(255, 255, 255, 0.4);
+}
+
+.swap-plan__note {
+  margin: 8px 0 0;
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.45);
 }
 </style>

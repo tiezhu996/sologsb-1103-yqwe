@@ -4,6 +4,7 @@ import type { CueLevel } from '@/types/level'
 import { INTENSITY_MAX, INTENSITY_MIN } from '@/types/level'
 import { db } from '@/utils/db'
 import { createId } from '@/utils/id'
+import { buildRelampPlan, type RelampPlan } from '@/utils/relamp'
 
 /** 通道电平补丁 */
 export interface CueLevelPatch {
@@ -108,6 +109,50 @@ export const useLevelStore = defineStore('level', () => {
     levels.value = levels.value.filter((level) => level.fixtureId !== fixtureId)
   }
 
+  /**
+   * 换灯：把源灯位的全部电平合并到备用灯位（同一 Cue 两边都设过时只留亮度大的），
+   * 随后删除源灯位剩余电平。levels 表在单事务内改写，避免半完成状态。
+   */
+  async function relocateLevelsForFixture(sourceFixtureId: string, targetFixtureId: string): Promise<RelampPlan> {
+    const sourceLevels = levels.value.filter((level) => level.fixtureId === sourceFixtureId)
+    const targetLevels = levels.value.filter((level) => level.fixtureId === targetFixtureId)
+    const plan = buildRelampPlan(sourceLevels, targetLevels)
+    const now = Date.now()
+
+    const toPut: CueLevel[] = []
+    const toDelete: string[] = []
+    plan.items.forEach((item) => {
+      if (item.conflict) {
+        // 两边都设过：留一条（沿用其原记录主键），删另一条
+        if (item.conflict.winner === 'source') {
+          toPut.push({ ...(item.winnerLevel as CueLevel), fixtureId: targetFixtureId, updatedAt: now })
+          const targetLevel = targetLevels.find((level) => level.cueId === item.cueId)
+          if (targetLevel) toDelete.push(targetLevel.id)
+        } else {
+          const sourceLevel = sourceLevels.find((level) => level.cueId === item.cueId)
+          if (sourceLevel) toDelete.push(sourceLevel.id)
+        }
+      } else if (item.winnerLevel?.fixtureId === sourceFixtureId) {
+        // 仅源通道设过：整条转到备用通道
+        toPut.push({ ...item.winnerLevel, fixtureId: targetFixtureId, updatedAt: now })
+      }
+    })
+    // 理论上源通道的电平均已在计划中处置，这里兜底删除其余残留
+    sourceLevels.forEach((level) => {
+      if (!toPut.some((item) => item.id === level.id) && !toDelete.includes(level.id)) {
+        toDelete.push(level.id)
+      }
+    })
+
+    await db.transaction('rw', db.levels, async () => {
+      // 先删后写，避免同 (cueId, fixtureId) 在事务内短暂出现两条
+      if (toDelete.length > 0) await db.levels.bulkDelete(toDelete)
+      if (toPut.length > 0) await db.levels.bulkPut(toPut)
+    })
+    levels.value = await db.levels.toArray()
+    return plan
+  }
+
   async function removeByCues(cueIds: readonly string[]): Promise<void> {
     const removing = new Set(cueIds)
     const ids = levels.value.filter((level) => removing.has(level.cueId)).map((level) => level.id)
@@ -129,6 +174,7 @@ export const useLevelStore = defineStore('level', () => {
     removeLevel,
     removeByCue,
     removeByFixture,
+    relocateLevelsForFixture,
     removeByCues
   }
 })

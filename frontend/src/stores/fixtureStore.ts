@@ -5,6 +5,7 @@ import { DMX_CHANNEL_MAX, DMX_CHANNEL_MIN } from '@/types/fixture'
 import { db } from '@/utils/db'
 import { createId } from '@/utils/id'
 import { buildPatchCheck, emptyPatchCheck, groupFixturesByPosition, sortFixturesByChannel } from '@/utils/patch'
+import type { RelampPlan } from '@/utils/relamp'
 import { useLevelStore } from '@/stores/levelStore'
 
 /** Fixture 可更新字段 */
@@ -15,6 +16,17 @@ export interface FixtureWriteResult {
   ok: boolean
   message: string
   fixture: Fixture | null
+}
+
+/** 换灯结果：携带电平合并计划，供页面汇总提示 */
+export interface RelampResult {
+  ok: boolean
+  message: string
+  /** 失败原因（页面在选不到本场备用通道时直接展示） */
+  reason: string | null
+  plan: RelampPlan | null
+  source: Fixture | null
+  target: Fixture | null
 }
 
 function validateChannel(channel: number): string | null {
@@ -131,6 +143,64 @@ export const useFixtureStore = defineStore('fixture', () => {
     applyPatchCheck(target.sessionId, buildPatchCheck(fixturesOfSession(target.sessionId)))
   }
 
+  /**
+   * 彩排前换灯：把故障通道（sourceFixtureId）已设好的电平转到本场已配接的备用通道
+   * （targetFixtureId）上接着用，两边都设过电平的只留亮度大的，随后原通道退出本场。
+   * 已生成的排演表是生成时刻快照，不在此动作的影响范围内。
+   */
+  async function relampFixture(sourceFixtureId: string, targetFixtureId: string): Promise<RelampResult> {
+    const source = fixtureById(sourceFixtureId)
+    if (!source) {
+      return { ok: false, message: '原通道不存在或已退出本场', reason: '原通道不存在或已退出本场', plan: null, source: null, target: null }
+    }
+    const target = fixtureById(targetFixtureId)
+    if (!target) {
+      return {
+        ok: false,
+        message: '备用通道在本场没有配过灯，换灯不生效',
+        reason: '该备用通道在本场没有配过灯：请先在本场完成配接，或改选已配接的通道作为备用通道。',
+        plan: null,
+        source,
+        target: null
+      }
+    }
+    if (target.sessionId !== source.sessionId) {
+      return {
+        ok: false,
+        message: '备用通道不在本场，换灯不生效',
+        reason: '该通道没有配在本场，不能作为本场的备用通道。',
+        plan: null,
+        source,
+        target
+      }
+    }
+    if (target.id === source.id) {
+      return {
+        ok: false,
+        message: '备用通道不能与原通道相同',
+        reason: '备用通道不能与原通道相同，请选择其他通道。',
+        plan: null,
+        source,
+        target
+      }
+    }
+
+    const levelStore = useLevelStore()
+    const finalPlan = await db.transaction('rw', [db.fixtures, db.levels], async () => {
+      const plan = await levelStore.relocateLevelsForFixture(source.id, target.id)
+      await db.fixtures.delete(source.id)
+      return plan
+    })
+    fixtures.value = fixtures.value.filter((fixture) => fixture.id !== source.id)
+    applyPatchCheck(source.sessionId, buildPatchCheck(fixturesOfSession(source.sessionId)))
+
+    const summary =
+      finalPlan.conflictCount > 0
+        ? `CH${source.channel} 已退出本场，${finalPlan.movedCount} 条电平转到 CH${target.channel}，${finalPlan.conflictCount} 条两边都设过、已保留亮度大的`
+        : `CH${source.channel} 已退出本场，${finalPlan.movedCount} 条电平转到 CH${target.channel}`
+    return { ok: true, message: summary, reason: null, plan: finalPlan, source, target }
+  }
+
   async function removeBySession(sessionId: string): Promise<void> {
     const targets = fixturesOfSession(sessionId)
     if (targets.length === 0) return
@@ -155,6 +225,7 @@ export const useFixtureStore = defineStore('fixture', () => {
     addFixture,
     updateFixture,
     removeFixture,
+    relampFixture,
     removeBySession
   }
 })
